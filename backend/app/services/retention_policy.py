@@ -1,9 +1,16 @@
-"""__NAME__领域服务：字段、状态和动作来自业务配置，数据处理骨架由基类复用。"""
+"""保留策略领域服务。
+
+规则详情与清理列表通过 ``retention_support.load_table_snapshots`` 读取同一份
+快照时间证据，时区换算统一交给 ``retention_engine``，因此两个入口对同一
+绝对时刻（含 ``+14:00`` 与 ``-12:00`` 等价时刻）的保留判定必然一致。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.retention_engine import registry
 from app.services.base import BaseModuleService
+from app.services.retention_support import load_table_snapshots
 from app.store import store
 
 
@@ -18,29 +25,72 @@ class RetentionPolicyService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def _safe_int(self, val: Any, default: int = 0) -> int:
-        try: return int(val)
-        except (ValueError, TypeError): return default
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _rule_config(self, entry: dict[str, Any]) -> tuple[int, int]:
+        """保留天数与最低版本数作为初始门槛读取。"""
+        retention_days = self._safe_int(entry.get("保留天数"), 30)
+        min_versions = self._safe_int(entry.get("最低版本数"), 5)
+        return retention_days, min_versions
 
     def domain_check_retention(self, entry_id: int) -> dict[str, Any]:
-        """对当前数据执行批次，联动状态和处理处理，产出标准化记录。处理流程：读取配置→执行批次→状态校验→处理批次→写入存储，下游可消费且批次可追溯。"""
+        """规则详情入口：对同一份快照绝对时刻执行保留判定（预览）。
+
+        处理流程：读取规则配置 → 装配与清理列表同源的快照集合 →
+        冻结/沿用截止时刻 → 逐条保留判定 → 回写规则待办结论。
+        """
         entry = store.find(self.MODULE, entry_id)
-        if not entry:        # 返回关联处理结果，含合并校验和状态批次信息
-
+        if not entry:
             return {"ok": False, "message": f"保留规则 {entry_id} 不存在"}
-        from app.compute import retention_checker
-        retention_days = self._safe_int(entry.get("保留天数"), 30)
-        snapshots = [
-            {"snapshot_id": f"s{entry_id}-{i}", "created_at": "2024-10-10T00:00:00Z"}
-            for i in range(1, 8)
-        ] + [
-            {"snapshot_id": f"s{entry_id}-{i}", "created_at": "2024-11-20T00:00:00Z"}
-            for i in range(8, 10)
-        ]
-        result = retention_checker(snapshots, retention_days=retention_days)        # 返回关联处理结果，含合并校验和状态批次信息
 
-        return {
+        retention_days, min_versions = self._rule_config(entry)
+        snapshots = load_table_snapshots(entry.get("目标湖表"))
+        preview = registry.preview(
+            entry_id,
+            snapshots,
+            retention_days=retention_days,
+            min_versions=min_versions,
+        )
+        evaluation = preview["evaluation"]
+        result = {
             "ok": True,
             "rule_id": entry.get("规则标识"),
             "table": entry.get("目标湖表"),
-            **result,
+            "time_basis": preview["plan"]["time_basis"],
+            "cutoff_utc": evaluation["cutoff_utc"],
+            "retention_days": evaluation["retention_days"],
+            "min_versions_required": evaluation["min_versions_required"],
+            "total_snapshots": evaluation["total_snapshots"],
+            "expired_count": evaluation["expired_count"],
+            "valid_count": evaluation["valid_count"],
+            "unverified_count": evaluation["unverified_count"],
+            "protected_count": evaluation["protected_count"],
+            "can_clean_count": evaluation["can_clean_count"],
+            "should_clean": evaluation["should_clean"],
+            "snapshots": evaluation["snapshots"],
+            "deletable": evaluation["deletable"],
+            "unverified": evaluation["unverified"],
+            "plan": preview["plan"],
+            "boundary_conflict": preview["boundary_conflict"],
         }
+        # 核对结论落在快照保留判定结果上，并回写保留策略待办。
+        entry["执行结果"] = self._summarize_result(evaluation)
+        entry["pending"] = evaluation["unverified_count"] > 0 or evaluation["should_clean"]
+        return result
+
+    def preview_plan(self, entry_id: int) -> dict[str, Any]:
+        """显式预览接口：语义与规则详情一致，返回完整计划与逐条判定。"""
+        return self.domain_check_retention(entry_id)
+
+    @staticmethod
+    def _summarize_result(evaluation: dict[str, Any]) -> str:
+        return (
+            f"截止时刻{evaluation['cutoff_utc']}："
+            f"可清理{evaluation['can_clean_count']}条，"
+            f"有效{evaluation['valid_count']}条，"
+            f"最低版本保护{evaluation['protected_count']}条，"
+            f"未核查{evaluation['unverified_count']}条"
+        )

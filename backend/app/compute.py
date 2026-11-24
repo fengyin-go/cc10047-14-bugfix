@@ -140,37 +140,33 @@ def retention_checker(
     retention_days: int = 30,
     min_versions: int = 5,
 ) -> dict[str, Any]:
-    """检查快照保留策略：标记可清理的过期快照。"""
-    from datetime import datetime, timedelta, timezone
+    """检查快照保留策略：标记可清理的过期快照。
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    expired = []
-    valid = []
+    时间统一换算为 UTC 绝对时刻后再比较，带 ``+14:00`` / ``-12:00`` 等不同
+    偏移但表示同一瞬间的快照得到完全相同的判定；缺少偏移、无法解释绝对
+    时刻的历史版本计入 ``unverified``，不会进入删除队列。
+    """
+    from app.retention_engine import evaluate_snapshots
 
-    for snap in snapshots:
-        ts = str(snap.get("created_at", ""))
-        # Strip timezone to make comparison naive
-        for suffix in ("Z", "+00:00", "+0000"):
-            ts = ts.replace(suffix, "")
-        ts = ts.split("+")[0]
-        try:
-            created = datetime.fromisoformat(ts)
-        except (ValueError, TypeError):
-            created = cutoff + timedelta(days=1)
-        if created.replace(tzinfo=None) < cutoff.replace(tzinfo=None):
-            expired.append(snap)
-        else:
-            valid.append(snap)
-
-    can_clean = max(0, len(expired) - min_versions)
+    evaluation = evaluate_snapshots(
+        snapshots,
+        retention_days=retention_days,
+        min_versions=min_versions,
+    )
+    # 保留历史调用方依赖的键名，同时补充带逐条判定的完整结果。
     return {
-        "total_snapshots": len(snapshots),
-        "expired_count": len(expired),
-        "valid_count": len(valid),
-        "min_versions_required": min_versions,
-        "retention_days": retention_days,
-        "can_clean_count": can_clean,
-        "should_clean": can_clean > 0,
+        "total_snapshots": evaluation["total_snapshots"],
+        "expired_count": evaluation["expired_count"],
+        "valid_count": evaluation["valid_count"],
+        "min_versions_required": evaluation["min_versions_required"],
+        "retention_days": evaluation["retention_days"],
+        "can_clean_count": evaluation["can_clean_count"],
+        "should_clean": evaluation["should_clean"],
+        "cutoff_utc": evaluation["cutoff_utc"],
+        "unverified_count": evaluation["unverified_count"],
+        "snapshots": evaluation["snapshots"],
+        "deletable": evaluation["deletable"],
+        "unverified": evaluation["unverified"],
     }
 
 
